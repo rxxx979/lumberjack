@@ -1,17 +1,16 @@
-# lumberjack  [![Go Reference](https://pkg.go.dev/badge/github.com/rxxx979/lumberjack/v2.svg)](https://pkg.go.dev/github.com/rxxx979/lumberjack/v2) ![Go Version](https://img.shields.io/badge/go-1.27-00ADD8)
+# lumberjack  [![Go Reference](https://pkg.go.dev/badge/github.com/rxxx979/lumberjack.svg)](https://pkg.go.dev/github.com/rxxx979/lumberjack) ![Go Version](https://img.shields.io/badge/go-1.27-00ADD8)
 
 ### Lumberjack is a Go package for writing logs to rolling files.
 
 Package lumberjack provides a rolling logger.
 
-Note that this is v2.0 of lumberjack, so it must be imported with the versioned
-module path:
+Import it as:
 
-    import "github.com/rxxx979/lumberjack/v2"
+    import "github.com/rxxx979/lumberjack"
 
-The package name remains simply lumberjack. This repository is a fork of
-https://github.com/natefinch/lumberjack (v2.0 branch), updated to build with
-Go 1.27.
+The package name is lumberjack. This repository is a fork of the v2.0 line of
+https://github.com/natefinch/lumberjack, updated to build with Go 1.27. It is
+versioned as v1 (no `/v2` suffix), so tags should be `v1.x.y`.
 
 
 Lumberjack is intended to be one part of a logging infrastructure.

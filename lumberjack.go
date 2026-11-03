@@ -1,12 +1,12 @@
 // Package lumberjack provides a rolling logger.
 //
-// Note that this is v2.0 of lumberjack, so it must be imported with a versioned
-// module path:
+// Import it as:
 //
-//	import "github.com/rxxx979/lumberjack/v2"
+//	import "github.com/rxxx979/lumberjack"
 //
-// The package name remains simply lumberjack. This module is a fork of
-// https://github.com/natefinch/lumberjack (v2.0 branch), updated for Go 1.27.
+// The package name is lumberjack. This module is a fork of the v2.0 line of
+// https://github.com/natefinch/lumberjack, updated for Go 1.27. It is
+// versioned as v1 because the fork uses an unversioned module path.
 //
 // Lumberjack is intended to be one part of a logging infrastructure.
 // It is not an all-in-one solution, but instead is a pluggable
