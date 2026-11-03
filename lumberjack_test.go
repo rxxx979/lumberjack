@@ -5,9 +5,9 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -21,10 +21,18 @@ import (
 // Since all the tests uses the time to determine filenames etc, we need to
 // control the wall clock as much as possible, which means having a wall clock
 // that doesn't change unless we want it to.
-var fakeCurrentTime = time.Now()
+//
+// It is an atomic pointer because the mill goroutine reads the clock while a
+// test advances it.
+var fakeCurrentTime atomic.Pointer[time.Time]
+
+func init() {
+	now := time.Now()
+	fakeCurrentTime.Store(&now)
+}
 
 func fakeTime() time.Time {
-	return fakeCurrentTime
+	return *fakeCurrentTime.Load()
 }
 
 func TestNewFile(t *testing.T) {
@@ -51,7 +59,7 @@ func TestOpenExisting(t *testing.T) {
 
 	filename := logFile(dir)
 	data := []byte("foo!")
-	err := ioutil.WriteFile(filename, data, 0644)
+	err := os.WriteFile(filename, data, 0o644)
 	isNil(err, t)
 	existsWithContent(filename, data, t)
 
@@ -176,7 +184,7 @@ func TestFirstWriteRotate(t *testing.T) {
 	defer l.Close()
 
 	start := []byte("boooooo!")
-	err := ioutil.WriteFile(filename, start, 0600)
+	err := os.WriteFile(filename, start, 0o600)
 	isNil(err, t)
 
 	newFakeTime()
@@ -265,13 +273,13 @@ func TestMaxBackups(t *testing.T) {
 	// create a file that is close to but different from the logfile name.
 	// It shouldn't get caught by our deletion filters.
 	notlogfile := logFile(dir) + ".foo"
-	err = ioutil.WriteFile(notlogfile, []byte("data"), 0644)
+	err = os.WriteFile(notlogfile, []byte("data"), 0o644)
 	isNil(err, t)
 
 	// Make a directory that exactly matches our log file filters... it still
 	// shouldn't get caught by the deletion filter since it's a directory.
 	notlogfiledir := backupFile(dir)
-	err = os.Mkdir(notlogfiledir, 0700)
+	err = os.Mkdir(notlogfiledir, 0o700)
 	isNil(err, t)
 
 	newFakeTime()
@@ -283,7 +291,7 @@ func TestMaxBackups(t *testing.T) {
 	// not be counted since both the compressed and the uncompressed
 	// log files still exist.
 	compLogFile := fourthFilename + compressSuffix
-	err = ioutil.WriteFile(compLogFile, []byte("compress"), 0644)
+	err = os.WriteFile(compLogFile, []byte("compress"), 0o644)
 	isNil(err, t)
 
 	// this will make us rotate again
@@ -332,24 +340,24 @@ func TestCleanupExistingBackups(t *testing.T) {
 
 	data := []byte("data")
 	backup := backupFile(dir)
-	err := ioutil.WriteFile(backup, data, 0644)
+	err := os.WriteFile(backup, data, 0o644)
 	isNil(err, t)
 
 	newFakeTime()
 
 	backup = backupFile(dir)
-	err = ioutil.WriteFile(backup+compressSuffix, data, 0644)
+	err = os.WriteFile(backup+compressSuffix, data, 0o644)
 	isNil(err, t)
 
 	newFakeTime()
 
 	backup = backupFile(dir)
-	err = ioutil.WriteFile(backup, data, 0644)
+	err = os.WriteFile(backup, data, 0o644)
 	isNil(err, t)
 
 	// now create a primary log file with some data
 	filename := logFile(dir)
-	err = ioutil.WriteFile(filename, data, 0644)
+	err = os.WriteFile(filename, data, 0o644)
 	isNil(err, t)
 
 	l := &Logger{
@@ -450,7 +458,7 @@ func TestOldLogFiles(t *testing.T) {
 
 	filename := logFile(dir)
 	data := []byte("data")
-	err := ioutil.WriteFile(filename, data, 07)
+	err := os.WriteFile(filename, data, 0o7)
 	isNil(err, t)
 
 	// This gives us a time with the same precision as the time we get from the
@@ -459,7 +467,7 @@ func TestOldLogFiles(t *testing.T) {
 	isNil(err, t)
 
 	backup := backupFile(dir)
-	err = ioutil.WriteFile(backup, data, 07)
+	err = os.WriteFile(backup, data, 0o7)
 	isNil(err, t)
 
 	newFakeTime()
@@ -468,7 +476,7 @@ func TestOldLogFiles(t *testing.T) {
 	isNil(err, t)
 
 	backup2 := backupFile(dir)
-	err = ioutil.WriteFile(backup2, data, 07)
+	err = os.WriteFile(backup2, data, 0o7)
 	isNil(err, t)
 
 	l := &Logger{Filename: filename}
@@ -654,9 +662,9 @@ func TestCompressOnResume(t *testing.T) {
 	// Create a backup file and empty "compressed" file.
 	filename2 := backupFile(dir)
 	b := []byte("foo!")
-	err := ioutil.WriteFile(filename2, b, 0644)
+	err := os.WriteFile(filename2, b, 0o644)
 	isNil(err, t)
-	err = ioutil.WriteFile(filename2+compressSuffix, []byte{}, 0644)
+	err = os.WriteFile(filename2+compressSuffix, []byte{}, 0o644)
 	isNil(err, t)
 
 	newFakeTime()
@@ -685,6 +693,79 @@ func TestCompressOnResume(t *testing.T) {
 	fileCount(dir, 2, t)
 }
 
+// TestCloseWaitsForPendingWork verifies that Close does not return until the
+// compression and removal triggered by a rotation have finished.
+func TestCloseWaitsForPendingWork(t *testing.T) {
+	currentTime = fakeTime
+	megabyte = 1
+
+	dir := makeTempDir("TestCloseWaitsForPendingWork", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+	l := &Logger{
+		Compress: true,
+		Filename: filename,
+		MaxSize:  10,
+	}
+	b := []byte("boo!")
+	n, err := l.Write(b)
+	isNil(err, t)
+	equals(len(b), n, t)
+
+	newFakeTime()
+
+	err = l.Rotate()
+	isNil(err, t)
+
+	// No sleep: Close has to drain the mill goroutine itself.
+	isNil(l.Close(), t)
+
+	// Close is idempotent.
+	isNil(l.Close(), t)
+
+	bc := new(bytes.Buffer)
+	gz := gzip.NewWriter(bc)
+	_, err = gz.Write(b)
+	isNil(err, t)
+	isNil(gz.Close(), t)
+
+	// The compressed backup should already be in place and the uncompressed
+	// one gone.
+	existsWithContent(backupFile(dir)+compressSuffix, bc.Bytes(), t)
+	notExist(backupFile(dir), t)
+}
+
+// TestWriteAfterClose verifies that a Logger stays usable after Close.
+func TestWriteAfterClose(t *testing.T) {
+	currentTime = fakeTime
+	megabyte = 1
+
+	dir := makeTempDir("TestWriteAfterClose", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+	l := &Logger{
+		Filename: filename,
+		MaxSize:  10,
+	}
+	b := []byte("boo!")
+	n, err := l.Write(b)
+	isNil(err, t)
+	equals(len(b), n, t)
+
+	isNil(l.Close(), t)
+
+	// Writing after Close reopens the file rather than panicking.
+	b2 := []byte("bar!")
+	n, err = l.Write(b2)
+	isNil(err, t)
+	equals(len(b2), n, t)
+
+	existsWithContent(filename, append(b, b2...), t)
+	isNil(l.Close(), t)
+}
+
 func TestJson(t *testing.T) {
 	data := []byte(`
 {
@@ -707,25 +788,23 @@ func TestJson(t *testing.T) {
 	equals(true, l.Compress, t)
 }
 
-// makeTempDir creates a file with a semi-unique name in the OS temp directory.
-// It should be based on the name of the test, to keep parallel tests from
-// colliding, and must be cleaned up after the test is finished.
-func makeTempDir(name string, t testing.TB) string {
-	dir := time.Now().Format(name + backupTimeFormat)
-	dir = filepath.Join(os.TempDir(), dir)
-	isNilUp(os.Mkdir(dir, 0700), t, 1)
-	return dir
+// makeTempDir creates a unique directory for the test and returns its path.
+// The directory is removed automatically when the test finishes.
+func makeTempDir(_ string, t testing.TB) string {
+	t.Helper()
+	return t.TempDir()
 }
 
 // existsWithContent checks that the given file exists and has the correct content.
 func existsWithContent(path string, content []byte, t testing.TB) {
+	t.Helper()
 	info, err := os.Stat(path)
-	isNilUp(err, t, 1)
-	equalsUp(int64(len(content)), info.Size(), t, 1)
+	isNil(err, t)
+	equals(int64(len(content)), info.Size(), t)
 
-	b, err := ioutil.ReadFile(path)
-	isNilUp(err, t, 1)
-	equalsUp(content, b, t, 1)
+	b, err := os.ReadFile(path)
+	isNil(err, t)
+	equals(content, b, t)
 }
 
 // logFile returns the log file name in the given directory for the current fake
@@ -750,23 +829,27 @@ func logFileLocal(dir string) string {
 
 // fileCount checks that the number of files in the directory is exp.
 func fileCount(dir string, exp int, t testing.TB) {
-	files, err := ioutil.ReadDir(dir)
-	isNilUp(err, t, 1)
+	t.Helper()
+	files, err := os.ReadDir(dir)
+	isNil(err, t)
 	// Make sure no other files were created.
-	equalsUp(exp, len(files), t, 1)
+	equals(exp, len(files), t)
 }
 
 // newFakeTime sets the fake "current time" to two days later.
 func newFakeTime() {
-	fakeCurrentTime = fakeCurrentTime.Add(time.Hour * 24 * 2)
+	t := fakeTime().Add(time.Hour * 24 * 2)
+	fakeCurrentTime.Store(&t)
 }
 
 func notExist(path string, t testing.TB) {
+	t.Helper()
 	_, err := os.Stat(path)
-	assertUp(os.IsNotExist(err), t, 1, "expected to get os.IsNotExist, but instead got %v", err)
+	assert(os.IsNotExist(err), t, "expected to get os.IsNotExist, but instead got %v", err)
 }
 
 func exists(path string, t testing.TB) {
+	t.Helper()
 	_, err := os.Stat(path)
-	assertUp(err == nil, t, 1, "expected file to exist, but got error from os.Stat: %v", err)
+	assert(err == nil, t, "expected file to exist, but got error from os.Stat: %v", err)
 }

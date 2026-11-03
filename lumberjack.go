@@ -1,12 +1,12 @@
 // Package lumberjack provides a rolling logger.
 //
-// Note that this is v2.0 of lumberjack, and should be imported using gopkg.in
-// thusly:
+// Note that this is v2.0 of lumberjack, so it must be imported with a versioned
+// module path:
 //
-//   import "gopkg.in/natefinch/lumberjack.v2"
+//	import "github.com/rxxx979/lumberjack/v2"
 //
-// The package name remains simply lumberjack, and the code resides at
-// https://github.com/natefinch/lumberjack under the v2.0 branch.
+// The package name remains simply lumberjack. This module is a fork of
+// https://github.com/natefinch/lumberjack (v2.0 branch), updated for Go 1.27.
 //
 // Lumberjack is intended to be one part of a logging infrastructure.
 // It is not an all-in-one solution, but instead is a pluggable
@@ -26,10 +26,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -66,7 +66,7 @@ var _ io.WriteCloser = (*Logger)(nil)
 // `/var/log/foo/server.log`, a backup created at 6:30pm on Nov 11 2016 would
 // use the filename `/var/log/foo/server-2016-11-04T18-30-00.000.log`
 //
-// Cleaning Up Old Log Files
+// # Cleaning Up Old Log Files
 //
 // Whenever a new logfile gets created, old log files may be deleted.  The most
 // recent files according to the encoded timestamp will be retained, up to a
@@ -111,8 +111,8 @@ type Logger struct {
 	file *os.File
 	mu   sync.Mutex
 
-	millCh    chan bool
-	startMill sync.Once
+	millCh   chan bool
+	doneMill chan struct{}
 }
 
 var (
@@ -161,11 +161,15 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-// Close implements io.Closer, and closes the current logfile.
+// Close implements io.Closer, and closes the current logfile.  It also waits
+// for any in-flight compression or removal of old log files to finish, so that
+// the files are in their final state when Close returns.
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.close()
+	err := l.close()
+	l.stopMill()
+	return err
 }
 
 // close closes the file if it is open.
@@ -206,13 +210,12 @@ func (l *Logger) rotate() error {
 // openNew opens a new log file for writing, moving any old log file out of the
 // way.  This methods assumes the file has already been closed.
 func (l *Logger) openNew() error {
-	err := os.MkdirAll(l.dir(), 0755)
-	if err != nil {
-		return fmt.Errorf("can't make directories for new logfile: %s", err)
+	if err := os.MkdirAll(l.dir(), 0o755); err != nil {
+		return fmt.Errorf("can't make directories for new logfile: %w", err)
 	}
 
 	name := l.filename()
-	mode := os.FileMode(0600)
+	mode := os.FileMode(0o600)
 	info, err := osStat(name)
 	if err == nil {
 		// Copy the mode off the old logfile.
@@ -220,7 +223,7 @@ func (l *Logger) openNew() error {
 		// move the existing file
 		newname := backupName(name, l.LocalTime)
 		if err := os.Rename(name, newname); err != nil {
-			return fmt.Errorf("can't rename log file: %s", err)
+			return fmt.Errorf("can't rename log file: %w", err)
 		}
 
 		// this is a no-op anywhere but linux
@@ -234,7 +237,7 @@ func (l *Logger) openNew() error {
 	// just wipe out the contents.
 	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
-		return fmt.Errorf("can't open new logfile: %s", err)
+		return fmt.Errorf("can't open new logfile: %w", err)
 	}
 	l.file = f
 	l.size = 0
@@ -266,18 +269,18 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 
 	filename := l.filename()
 	info, err := osStat(filename)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		return l.openNew()
 	}
 	if err != nil {
-		return fmt.Errorf("error getting log file info: %s", err)
+		return fmt.Errorf("error getting log file info: %w", err)
 	}
 
 	if info.Size()+int64(writeLen) >= l.max() {
 		return l.rotate()
 	}
 
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		// if we fail to open the old log file for some reason, just ignore
 		// it and open a new log file.
@@ -319,10 +322,7 @@ func (l *Logger) millRunOnce() error {
 		for _, f := range files {
 			// Only count the uncompressed log file or the
 			// compressed log file, not both.
-			fn := f.Name()
-			if strings.HasSuffix(fn, compressSuffix) {
-				fn = fn[:len(fn)-len(compressSuffix)]
-			}
+			fn, _ := strings.CutSuffix(f.Name(), compressSuffix)
 			preserved[fn] = true
 
 			if len(preserved) > l.MaxBackups {
@@ -334,8 +334,7 @@ func (l *Logger) millRunOnce() error {
 		files = remaining
 	}
 	if l.MaxAge > 0 {
-		diff := time.Duration(int64(24*time.Hour) * int64(l.MaxAge))
-		cutoff := currentTime().Add(-1 * diff)
+		cutoff := currentTime().Add(-24 * time.Hour * time.Duration(l.MaxAge))
 
 		var remaining []logInfo
 		for _, f := range files {
@@ -356,27 +355,27 @@ func (l *Logger) millRunOnce() error {
 		}
 	}
 
+	var errs []error
 	for _, f := range remove {
-		errRemove := os.Remove(filepath.Join(l.dir(), f.Name()))
-		if err == nil && errRemove != nil {
-			err = errRemove
+		if err := os.Remove(filepath.Join(l.dir(), f.Name())); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	for _, f := range compress {
 		fn := filepath.Join(l.dir(), f.Name())
-		errCompress := compressLogFile(fn, fn+compressSuffix)
-		if err == nil && errCompress != nil {
-			err = errCompress
+		if err := compressLogFile(fn, fn+compressSuffix); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
-	return err
+	return errors.Join(errs...)
 }
 
 // millRun runs in a goroutine to manage post-rotation compression and removal
-// of old log files.
-func (l *Logger) millRun() {
-	for range l.millCh {
+// of old log files.  It exits when millCh is closed.
+func (l *Logger) millRun(millCh chan bool, done chan struct{}) {
+	defer close(done)
+	for range millCh {
 		// what am I going to do, log this?
 		_ = l.millRunOnce()
 	}
@@ -384,45 +383,69 @@ func (l *Logger) millRun() {
 
 // mill performs post-rotation compression and removal of stale log files,
 // starting the mill goroutine if necessary.
+//
+// The caller must hold l.mu.
 func (l *Logger) mill() {
-	l.startMill.Do(func() {
+	if l.millCh == nil {
 		l.millCh = make(chan bool, 1)
-		go l.millRun()
-	})
+		l.doneMill = make(chan struct{})
+		go l.millRun(l.millCh, l.doneMill)
+	}
 	select {
 	case l.millCh <- true:
 	default:
 	}
 }
 
-// oldLogFiles returns the list of backup log files stored in the same
-// directory as the current log file, sorted by ModTime
-func (l *Logger) oldLogFiles() ([]logInfo, error) {
-	files, err := ioutil.ReadDir(l.dir())
-	if err != nil {
-		return nil, fmt.Errorf("can't read log file directory: %s", err)
+// stopMill shuts down the mill goroutine after it has drained any pending work.
+// It is a no-op if the mill was never started, which also makes it safe to call
+// more than once.
+//
+// The caller must hold l.mu.
+func (l *Logger) stopMill() {
+	if l.millCh == nil {
+		return
 	}
-	logFiles := []logInfo{}
+	close(l.millCh)
+	<-l.doneMill
+	l.millCh = nil
+	l.doneMill = nil
+}
+
+// oldLogFiles returns the list of backup log files stored in the same
+// directory as the current log file, sorted by the timestamp encoded in their
+// name, newest first.
+func (l *Logger) oldLogFiles() ([]logInfo, error) {
+	entries, err := os.ReadDir(l.dir())
+	if err != nil {
+		return nil, fmt.Errorf("can't read log file directory: %w", err)
+	}
 
 	prefix, ext := l.prefixAndExt()
 
-	for _, f := range files {
-		if f.IsDir() {
+	logFiles := make([]logInfo, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
 			continue
 		}
-		if t, err := l.timeFromName(f.Name(), prefix, ext); err == nil {
-			logFiles = append(logFiles, logInfo{t, f})
-			continue
+		name := entry.Name()
+		t, err := l.timeFromName(name, prefix, ext)
+		if err != nil {
+			t, err = l.timeFromName(name, prefix, ext+compressSuffix)
+			if err != nil {
+				// error parsing means that the suffix at the end was not
+				// generated by lumberjack, and therefore it's not a backup
+				// file.
+				continue
+			}
 		}
-		if t, err := l.timeFromName(f.Name(), prefix, ext+compressSuffix); err == nil {
-			logFiles = append(logFiles, logInfo{t, f})
-			continue
-		}
-		// error parsing means that the suffix at the end was not generated
-		// by lumberjack, and therefore it's not a backup file.
+		logFiles = append(logFiles, logInfo{t, entry})
 	}
 
-	sort.Sort(byFormatTime(logFiles))
+	// Sort by the timestamp in the name, newest first.
+	slices.SortFunc(logFiles, func(a, b logInfo) int {
+		return b.timestamp.Compare(a.timestamp)
+	})
 
 	return logFiles, nil
 }
@@ -431,13 +454,14 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 // the filename's prefix and extension. This prevents someone's filename from
 // confusing time.parse.
 func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
-	if !strings.HasPrefix(filename, prefix) {
+	ts, ok := strings.CutPrefix(filename, prefix)
+	if !ok {
 		return time.Time{}, errors.New("mismatched prefix")
 	}
-	if !strings.HasSuffix(filename, ext) {
+	ts, ok = strings.CutSuffix(ts, ext)
+	if !ok {
 		return time.Time{}, errors.New("mismatched extension")
 	}
-	ts := filename[len(prefix) : len(filename)-len(ext)]
 	return time.Parse(backupTimeFormat, ts)
 }
 
@@ -468,24 +492,24 @@ func (l *Logger) prefixAndExt() (prefix, ext string) {
 func compressLogFile(src, dst string) (err error) {
 	f, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("failed to open log file: %v", err)
+		return fmt.Errorf("failed to open log file: %w", err)
 	}
 	defer f.Close()
 
 	fi, err := osStat(src)
 	if err != nil {
-		return fmt.Errorf("failed to stat log file: %v", err)
+		return fmt.Errorf("failed to stat log file: %w", err)
 	}
 
 	if err := chown(dst, fi); err != nil {
-		return fmt.Errorf("failed to chown compressed log file: %v", err)
+		return fmt.Errorf("failed to chown compressed log file: %w", err)
 	}
 
 	// If this file already exists, we presume it was created by
 	// a previous attempt to compress the log file.
 	gzf, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
 	if err != nil {
-		return fmt.Errorf("failed to open compressed log file: %v", err)
+		return fmt.Errorf("failed to open compressed log file: %w", err)
 	}
 	defer gzf.Close()
 
@@ -494,7 +518,7 @@ func compressLogFile(src, dst string) (err error) {
 	defer func() {
 		if err != nil {
 			os.Remove(dst)
-			err = fmt.Errorf("failed to compress log file: %v", err)
+			err = fmt.Errorf("failed to compress log file: %w", err)
 		}
 	}()
 
@@ -518,24 +542,8 @@ func compressLogFile(src, dst string) (err error) {
 	return nil
 }
 
-// logInfo is a convenience struct to return the filename and its embedded
-// timestamp.
+// logInfo pairs a backup file's embedded timestamp with its directory entry.
 type logInfo struct {
 	timestamp time.Time
-	os.FileInfo
-}
-
-// byFormatTime sorts by newest time formatted in the name.
-type byFormatTime []logInfo
-
-func (b byFormatTime) Less(i, j int) bool {
-	return b[i].timestamp.After(b[j].timestamp)
-}
-
-func (b byFormatTime) Swap(i, j int) {
-	b[i], b[j] = b[j], b[i]
-}
-
-func (b byFormatTime) Len() int {
-	return len(b)
+	fs.DirEntry
 }

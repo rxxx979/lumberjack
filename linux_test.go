@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 package lumberjack
 
@@ -16,7 +16,7 @@ func TestMaintainMode(t *testing.T) {
 
 	filename := logFile(dir)
 
-	mode := os.FileMode(0600)
+	mode := os.FileMode(0o600)
 	f, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, mode)
 	isNil(err, t)
 	f.Close()
@@ -60,7 +60,7 @@ func TestMaintainOwner(t *testing.T) {
 
 	filename := logFile(dir)
 
-	f, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0o644)
 	isNil(err, t)
 	f.Close()
 
@@ -92,7 +92,7 @@ func TestCompressMaintainMode(t *testing.T) {
 
 	filename := logFile(dir)
 
-	mode := os.FileMode(0600)
+	mode := os.FileMode(0o600)
 	f, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, mode)
 	isNil(err, t)
 	f.Close()
@@ -143,7 +143,7 @@ func TestCompressMaintainOwner(t *testing.T) {
 
 	filename := logFile(dir)
 
-	f, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0o644)
 	isNil(err, t)
 	f.Close()
 
